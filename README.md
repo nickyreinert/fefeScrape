@@ -1,5 +1,5 @@
 # fefeScrape
-Parse fefe's blog to count words, message and used sources (links to external pages)
+Parse fefes blog to count words, message and used sources (links to external pages)
 
 This is a Python script that scrapes all content from blog.fefe.de to count words, messages and links to external sources. 
 
