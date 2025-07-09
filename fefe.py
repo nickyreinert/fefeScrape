@@ -8,6 +8,56 @@ from bs4 import BeautifulSoup # xml/html parser
 import re # regular expresions
 import json # to convert python's dictionary to json
 import sys, getopt # to get parameters from command line
+import signal
+import select
+import termios
+import tty
+
+# Global flag for interrupt handling
+interrupt_requested = False
+
+def signal_handler(signum, frame):
+    """Handle Ctrl+C gracefully"""
+    global interrupt_requested
+    interrupt_requested = True
+    print("\n\nInterrupt received! Finishing current message and saving data...")
+
+def check_for_escape():
+    """Check if ESC key was pressed (non-blocking)"""
+    global interrupt_requested
+    
+    # Simple fallback: just return if already interrupted
+    if interrupt_requested:
+        return True
+    
+    # Only check on Unix-like systems (macOS, Linux)
+    if sys.platform not in ['darwin', 'linux', 'linux2']:
+        return False
+        
+    try:
+        # Check if input is available
+        if select.select([sys.stdin], [], [], 0) == ([sys.stdin], [], []):
+            # Save terminal settings
+            old_settings = termios.tcgetattr(sys.stdin)
+            try:
+                # Set terminal to raw mode
+                tty.setraw(sys.stdin.fileno())
+                # Read one character
+                char = sys.stdin.read(1)
+                # Check if it's ESC (ASCII 27)
+                if ord(char) == 27:
+                    interrupt_requested = True
+                    print("\n\nESC pressed! Finishing current message and saving data...")
+                    return True
+            finally:
+                # Restore terminal settings
+                termios.tcsetattr(sys.stdin, termios.TCSADRAIN, old_settings)
+    except Exception as e:
+        # If there's any error with terminal handling, just continue silently
+        # This handles cases where terminal manipulation is not available
+        pass
+    
+    return False
 
 # thanks to https://www.netaction.de/datenvisualisierung-von-fefes-blogzeiten/ for figuring this out
 timestampKey    = 0xFEFEC0DE
@@ -192,7 +242,22 @@ def getMessages(startDate, inputFile, outputFile, iMax, verbose, parseSource, fo
 
     log(f"Starting main processing loop for {pagesToQuery} pages", 2, verbose)
 
+    # Set up signal handler for Ctrl+C
+    signal.signal(signal.SIGINT, signal_handler)
+    print("Press ESC or Ctrl+C to interrupt and save data safely...")
+
     while startDateObj <= endDateObj:
+
+        # Check for interrupt at the beginning of each month
+        if interrupt_requested:
+            print(f"\nInterrupt detected. Saving data and exiting...")
+            break
+            
+        # Check for ESC key press (non-blocking)
+        check_for_escape()
+        if interrupt_requested:
+            print(f"\nInterrupt detected. Saving data and exiting...")
+            break
 
         currentMonth = startDateObj.strftime('%Y%m')
         currentUrl = urlTemplate + currentMonth
@@ -288,12 +353,22 @@ def getMessages(startDate, inputFile, outputFile, iMax, verbose, parseSource, fo
                     log(f"  Contains {len(lis)} <li> elements", 10, verbose)
                     
         for listIndex, unorderedList in enumerate(unorderedLists):
+            # Check for interrupt at the beginning of each day's processing
+            if interrupt_requested:
+                print(f"\nInterrupt detected during day processing. Breaking out of day loop...")
+                break
+                
             log(f"Processing unordered list {listIndex + 1}/{len(unorderedLists)}", 8, verbose)
          
             # Instead of prettify, let's get the raw HTML and split by <li> manually
             # This will handle the unclosed <li> tags properly
             ulHtml = str(unorderedList)
             log(f"Raw UL HTML length: {len(ulHtml)}", 10, verbose)
+            
+            # Try to find the date header for this list (usually an h3 tag before the ul)
+            currentDay = "unknown"
+            if unorderedList.find_previous('h3'):
+                currentDay = unorderedList.find_previous('h3').get_text().strip()
             
             # Split by <li> tags but keep the <li> tag with each part
             import re
@@ -326,10 +401,22 @@ def getMessages(startDate, inputFile, outputFile, iMax, verbose, parseSource, fo
                         totalMessages += 1
                         break
 
-            print(f"Found {totalMessages} messages to process in {currentMonth}")
+            print(f"Found {totalMessages} messages to process for {currentDay}")
             processedMessages = 0
 
             for messageIndex, rawMessage in enumerate(rawMessages):
+                # Check for interrupt during message processing
+                if interrupt_requested:
+                    print(f"\nInterrupt detected during message processing. Breaking out of message loop...")
+                    break
+                    
+                # Periodically check for ESC key (every 10 messages to avoid performance impact)
+                if messageIndex % 10 == 0:
+                    check_for_escape()
+                    if interrupt_requested:
+                        print(f"\nInterrupt detected during message processing. Breaking out of message loop...")
+                        break
+                
                 log(f"Processing message {messageIndex + 1}/{len(rawMessages)}", 12, verbose)
 
                 try:
@@ -411,7 +498,7 @@ def getMessages(startDate, inputFile, outputFile, iMax, verbose, parseSource, fo
 
                     messages[message['hexTimestamp']] = message
                     processedMessages += 1
-                    print(f"Processing {currentMonth}: {processedMessages}/{totalMessages} messages", end='\r')
+                    print(f"Processing {currentDay}: {processedMessages}/{totalMessages} messages", end='\r')
                     log(f"Message {message['hexTimestamp']} successfully processed", 14, verbose)
                     
                 except Exception as e:
@@ -435,9 +522,15 @@ def getMessages(startDate, inputFile, outputFile, iMax, verbose, parseSource, fo
             break
 
     log("Starting data output", 2, verbose)
+    if interrupt_requested:
+        print(f"\nSaving data due to interrupt. Total messages processed so far: {len(messages)}")
     putDataToDisk(messages, wordsUsed, domainsUsed, verbose)
     
-    log(f"Processing complete. Total messages: {len(messages)}", 0, verbose)
+    if interrupt_requested:
+        print("Data saved successfully after interrupt!")
+        log(f"Processing interrupted by user. Total messages: {len(messages)}", 0, verbose)
+    else:
+        log(f"Processing complete. Total messages: {len(messages)}", 0, verbose)
     print ('Found {} invalid <a>-tag(s) w/o href-attribute '.format(invalidATags))
 
 def putRawHtmlToDisk(html, currentMonth, outputFile, verbose):
