@@ -150,7 +150,23 @@ def parseExternalSource(url, verbose):
         log(f"Error parsing {url}: {str(e)}", 20, verbose)
         return None
 
-def getMessages(startDate, inputFile, outputFile, iMax, verbose, parseSource):
+def isMonthAlreadyProcessed(month, verbose):
+    """
+    Check if a month has already been processed by looking for existing HTML output file.
+    Returns True if the month should be skipped, False otherwise.
+    """
+    import os
+    
+    # Check if HTML output file exists for this month
+    html_filename = f"{month}data.html"
+    if os.path.exists(html_filename):
+        log(f"Found existing HTML file for month {month}: {html_filename}", 6, verbose)
+        return True
+    
+    log(f"No existing HTML file found for month {month}", 6, verbose)
+    return False
+
+def getMessages(startDate, inputFile, outputFile, iMax, verbose, parseSource, force):
 
     log("Starting message parsing", 0, verbose)
     
@@ -180,6 +196,13 @@ def getMessages(startDate, inputFile, outputFile, iMax, verbose, parseSource):
 
         currentMonth = startDateObj.strftime('%Y%m')
         log(f"Processing month: {currentMonth}", 4, verbose)
+
+        # Check if this month has already been processed
+        if not force and isMonthAlreadyProcessed(currentMonth, verbose):
+            log(f"Month {currentMonth} already processed, skipping", 4, verbose)
+            startDateObj = startDateObj + relativedelta(months=+1)
+            i += 1
+            continue
 
         domainsUsed[currentMonth] = {}
         wordsUsed[currentMonth] = {}
@@ -653,6 +676,10 @@ def getParameters():
                         action='store_true',
                         help='parse external links to extract meta data like titles from linked sources')
 
+    parser.add_argument('--force',
+                        action='store_true',
+                        help='force reprocessing of months that have already been processed')
+
     if len(sys.argv) == 1:
         parser.print_help()
         sys.exit(0)
@@ -664,16 +691,17 @@ def getParameters():
     iMax = args.limit
     verbose = args.verbose
     parseSource = args.parse_source
+    force = args.force
 
     if startDate == None and inputFile == None:
         print ('\r\n!!!Start date or input file are not provided. At least one is required!!! \r\n')
         parser.print_help()
         sys.exit(-1)
     
-    return startDate, inputFile, outputFile, iMax, verbose, parseSource
+    return startDate, inputFile, outputFile, iMax, verbose, parseSource, force
 
 if __name__ == '__main__':
      
-    startDate, inputFile, outputFile, iMax, verbose, parseSource = getParameters()
+    startDate, inputFile, outputFile, iMax, verbose, parseSource, force = getParameters()
 
-    getMessages(startDate, inputFile, outputFile, iMax, verbose, parseSource)
+    getMessages(startDate, inputFile, outputFile, iMax, verbose, parseSource, force)
