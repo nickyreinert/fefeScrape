@@ -1,19 +1,13 @@
+#!./.venv/bin/python3
 import urllib.request
+import ssl
 from datetime import datetime
 from dateutil.relativedelta import *
+import argparse
 from bs4 import BeautifulSoup # xml/html parser
 import re # regular expresions
 import json # to convert python's dictionary to json
 import sys, getopt # to get parameters from command line
-
-# where to start, expecting a month here, has to be provided as command line parameter
-startDate       = None
-
-# if a local file is provided, we do not send request to remote location, for dry run tests
-inputFile       = None
-
-# this is for the raw data
-outputFile      = None
 
 # thanks to https://www.netaction.de/datenvisualisierung-von-fefes-blogzeiten/ for figuring this out
 timestampKey    = 0xFEFEC0DE
@@ -22,15 +16,8 @@ timestampKey    = 0xFEFEC0DE
 urlTemplate     = "https://blog.fefe.de/?mon="
 
 # prevent loop to run infinitely, for backup, script stops afert iMax iterations
-i               = 0
 iMax            = 240
 
-# thats the output dictionary, containing all messages with meta data, timestamps etc.pp.
-messages        = {}
-
-# to create a cloud of used words, where the count of occurances defines the size, 
-# we count all words fefe is using in an global dictionary
-wordsUsed       = {}
 # what chars to strip from words, before consider them
 ignoreChars     = '()[],;.:\!?"„\''
 # using regex for a more cleaner result, ignore the prior line, see description below
@@ -39,118 +26,362 @@ ignoreCharsRegEx = '[\W\_]' # \W would not work, because _ is being ignored
 minWordLength   = 4
 # heads up: as we also strip special chars (,.;) this will also ignore smilies... we dont count, how much Fefe uses smilies.
 
-# let's also count what references fefe makes
-domainsUsed     = {}
-# sometimes fefe forgets to close a-tags, e.g. blog.fefe.de/?ts=bc6432f7 -  this creates invalid links, apparently, lets count them
-# this is also a possible error source, because the xml parse, as in this case mentioned considers the next message as part of the message 
-# with the wrong <a>-tag, that's why we are counting it, to give an error-estimation
-invalidATags  = 0
 
-def getMessages(startDate):
+def log(message, indent=0, verbose=False):
+    if not verbose:
+        return
+    if indent > 0:
+        print(' ' * indent, end='')
+    print(message)
 
-    # TODO: improve handling of variables / globals
-    global iMax, i, invalidATags, progress, pagesToQuery, inputFile, iMax, startDateObj, endDateObj, currentMonth
+def parseExternalSource(url, verbose):
+    """
+    Parse external URL to extract meta data like title, description, etc.
+    Returns a dictionary with extracted meta data.
+    """
+    log(f"Parsing external source: {url}", 18, verbose)
     
-    progress = 0 
+    try:
+        # Create SSL context for potentially problematic certificates
+        ssl_context = ssl.create_default_context()
+        ssl_context.check_hostname = False
+        ssl_context.verify_mode = ssl.CERT_NONE
+        
+        # Add headers to mimic a real browser
+        req = urllib.request.Request(url, headers={
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+        })
+        
+        # Fetch the page with timeout
+        with urllib.request.urlopen(req, context=ssl_context, timeout=10) as response:
+            if response.getcode() != 200:
+                log(f"HTTP {response.getcode()} for {url}", 20, verbose)
+                return None
+                
+            html = response.read().decode('utf-8', errors='ignore')
+            
+        # Parse HTML to extract meta data
+        soup = BeautifulSoup(html, features="html.parser")
+        
+        metadata = {
+            'title': None,
+            'description': None,
+            'author': None,
+            'published': None,
+            'site_name': None,
+            'url': url
+        }
+        
+        # Try to get title from various sources
+        title_sources = [
+            soup.find('meta', {'property': 'og:title'}),
+            soup.find('meta', {'name': 'twitter:title'}),
+            soup.find('title'),
+            soup.find('h1')
+        ]
+        
+        for source in title_sources:
+            if source:
+                if source.name == 'meta':
+                    metadata['title'] = source.get('content', '').strip()
+                else:
+                    metadata['title'] = source.get_text().strip()
+                if metadata['title']:
+                    break
+        
+        # Try to get description
+        desc_sources = [
+            soup.find('meta', {'property': 'og:description'}),
+            soup.find('meta', {'name': 'twitter:description'}),
+            soup.find('meta', {'name': 'description'})
+        ]
+        
+        for source in desc_sources:
+            if source:
+                metadata['description'] = source.get('content', '').strip()
+                if metadata['description']:
+                    break
+        
+        # Try to get author
+        author_sources = [
+            soup.find('meta', {'name': 'author'}),
+            soup.find('meta', {'property': 'article:author'}),
+            soup.find('meta', {'name': 'twitter:creator'})
+        ]
+        
+        for source in author_sources:
+            if source:
+                metadata['author'] = source.get('content', '').strip()
+                if metadata['author']:
+                    break
+        
+        # Try to get published date
+        date_sources = [
+            soup.find('meta', {'property': 'article:published_time'}),
+            soup.find('meta', {'name': 'date'}),
+            soup.find('time')
+        ]
+        
+        for source in date_sources:
+            if source:
+                if source.name == 'meta':
+                    metadata['published'] = source.get('content', '').strip()
+                else:
+                    metadata['published'] = source.get('datetime', source.get_text()).strip()
+                if metadata['published']:
+                    break
+        
+        # Try to get site name
+        site_sources = [
+            soup.find('meta', {'property': 'og:site_name'}),
+            soup.find('meta', {'name': 'application-name'})
+        ]
+        
+        for source in site_sources:
+            if source:
+                metadata['site_name'] = source.get('content', '').strip()
+                if metadata['site_name']:
+                    break
+        
+        log(f"Extracted metadata: title='{metadata['title']}', site='{metadata['site_name']}'", 20, verbose)
+        return metadata
+        
+    except Exception as e:
+        log(f"Error parsing {url}: {str(e)}", 20, verbose)
+        return None
 
-    prepareInput()
+def getMessages(startDate, inputFile, outputFile, iMax, verbose, parseSource):
+
+    log("Starting message parsing", 0, verbose)
+    
+    # Initialize local variables instead of using globals
+    i = 0
+    invalidATags = 0
+    progress = 0 
+    
+    # Initialize data structures
+    messages = {}
+    wordsUsed = {}
+    domainsUsed = {}
+    
+    log("Initialized data structures", 2, verbose)
+    
+    # Prepare input and get required values
+    startDateObj, endDateObj, pagesToQuery = prepareInput(startDate, iMax, verbose)
 
     print ('\r\nParsing...')
 
     domainsUsed['sum'] = {}
     wordsUsed['sum'] = {}
 
+    log(f"Starting main processing loop for {pagesToQuery} pages", 2, verbose)
+
     while startDateObj <= endDateObj:
 
         currentMonth = startDateObj.strftime('%Y%m')
+        log(f"Processing month: {currentMonth}", 4, verbose)
 
         domainsUsed[currentMonth] = {}
         wordsUsed[currentMonth] = {}
 
-        showProgress()
-
+        showProgress(i, pagesToQuery)
         if inputFile == None:
             url = urlTemplate + currentMonth
-            html = urllib.request.urlopen(url).read()
-            html = html.decode('utf8')
+            log(f"Fetching from URL: {url}", 6, verbose)
+            try:
+                html = urllib.request.urlopen(url).read()
+                html = html.decode('utf8')
+                log(f"Successfully fetched {len(html)} characters", 8, verbose)
+            except urllib.error.URLError as e:
+                if 'CERTIFICATE_VERIFY_FAILED' in str(e):
+                    log("SSL certificate verification failed, retrying without verification", 8, verbose)
+                    # Create an SSL context that doesn't verify certificates
+                    ssl_context = ssl.create_default_context()
+                    ssl_context.check_hostname = False
+                    ssl_context.verify_mode = ssl.CERT_NONE
+                    html = urllib.request.urlopen(url, context=ssl_context).read()
+                    html = html.decode('utf8')
+                    log(f"Successfully fetched {len(html)} characters without SSL verification", 8, verbose)
+                else:
+                    raise
         else:
-            resInputFile = open('{}{}'.format(currentMonth, inputFile), 'r', encoding='utf8')
+            inputFileName = '{}{}'.format(currentMonth, inputFile)
+            log(f"Reading from local file: {inputFileName}", 6, verbose)
+            resInputFile = open(inputFileName, 'r', encoding='utf8')
             html = resInputFile.read()
             resInputFile.close()
+            log(f"Successfully read {len(html)} characters from file", 8, verbose)
 
-        putRawHtmlToDisk(html)
+        putRawHtmlToDisk(html, currentMonth, outputFile, verbose)
 
         # thats our function to sanitize incoming html, see above comment: if fefe does not close the <a>-tag, our parser
         # tries to close it, but this will affect following list elements, so we try to fix it ourself
         htmlLines = html.splitlines()
         cleanHtmlLines = []
         
+        log("Sanitizing HTML for unclosed <a> tags", 6, verbose)
         for line in htmlLines:
             cleanLine = line
             if cleanLine.count('<a') != cleanLine.count('</a>'):
                 invalidATags += 1
+                log(f"Found unclosed <a> tag in line, fixing...", 8, verbose)
                 while cleanLine.count('<a') > cleanLine.count('</a>'):
                     cleanLine += '</a>'
             cleanHtmlLines.append(cleanLine)
 
         html = ''.join(cleanHtmlLines)
+        log(f"HTML sanitization complete. Found {invalidATags} invalid tags so far", 6, verbose)
 
         # since fefe does not provide closing end tag for <li>, we need to use lxml parser
         # if you want to use html.parser, make sure to define selfClosingTags=["li"]
-        htmlObj = BeautifulSoup(html, features="lxml")
+        # We'll use a different approach to handle the unclosed <li> tags
+        log("Parsing HTML with BeautifulSoup", 6, verbose)
+        htmlObj = BeautifulSoup(html, features="html.parser")
+        
+        # Debug: Let's see what the parsed HTML structure looks like
+        log(f"HTML structure debug - looking for <ul> tags", 6, verbose)
+        allUlTags = htmlObj.find_all('ul')
+        log(f"Found {len(allUlTags)} <ul> tags total (recursive=True)", 6, verbose)
         
         # loop through every message and get some date
+        unorderedLists = htmlObj.find_all('ul', recursive=False)
+        log(f"Found {len(unorderedLists)} unordered lists (recursive=False)", 6, verbose)
         
-        for unorderedLists in htmlObj.body.find_all('ul', recursive=False):
+        # If we don't find any with recursive=False, let's try with recursive=True
+        if len(unorderedLists) == 0:
+            log("No <ul> found with recursive=False, trying recursive=True", 6, verbose)
+            unorderedLists = htmlObj.find_all('ul', recursive=True)
+            log(f"Found {len(unorderedLists)} unordered lists (recursive=True)", 6, verbose)
+            
+            # Let's also check the HTML structure
+            if verbose:
+                log("HTML structure around <ul>:", 8, verbose)
+                for i, ul in enumerate(unorderedLists):
+                    log(f"UL {i}: parent = {ul.parent.name if ul.parent else 'None'}", 10, verbose)
+                    lis = ul.find_all('li', recursive=False)
+                    log(f"  Contains {len(lis)} <li> elements", 10, verbose)
+                    
+        for listIndex, unorderedList in enumerate(unorderedLists):
+            log(f"Processing unordered list {listIndex + 1}/{len(unorderedLists)}", 8, verbose)
          
-            unorderedLists.prettify()
+            # Instead of prettify, let's get the raw HTML and split by <li> manually
+            # This will handle the unclosed <li> tags properly
+            ulHtml = str(unorderedList)
+            log(f"Raw UL HTML length: {len(ulHtml)}", 10, verbose)
+            
+            # Split by <li> tags but keep the <li> tag with each part
+            import re
+            liParts = re.split(r'(<li[^>]*>)', ulHtml)
+            
+            # Reconstruct individual <li> elements
+            rawMessages = []
+            for i in range(1, len(liParts), 2):  # Skip first empty part, then take every second part
+                if i + 1 < len(liParts):
+                    liTag = liParts[i]
+                    liContent = liParts[i + 1]
+                    
+                    # Remove the closing </ul> tag if present
+                    liContent = liContent.replace('</ul>', '')
+                    
+                    # Create a proper HTML element
+                    liHtml = liTag + liContent + '</li>'
+                    liElement = BeautifulSoup(liHtml, features="html.parser").find('li')
+                    if liElement:
+                        rawMessages.append(liElement)
+            
+            log(f"Found {len(rawMessages)} messages after manual parsing", 10, verbose)
 
-            for rawMessage in unorderedLists.find_all('li', recursive=False):
+            for messageIndex, rawMessage in enumerate(rawMessages):
+                log(f"Processing message {messageIndex + 1}/{len(rawMessages)}", 12, verbose)
 
-                message = {
-                    'timestamp'     : None,
-                    'hexTimestamp'  : None,
-                    'quoteCount'    : 0,
-                    'wordCount'     : 0,
-                    'sourcesCount'  : 0,
-                    'url'           : None # this is more for examination purposes: providing the url to check the results
-                }
-                
+                try:
+                    message = {
+                        'timestamp'     : None,
+                        'hexTimestamp'  : None,
+                        'quoteCount'    : 0,
+                        'wordCount'     : 0,
+                        'sourcesCount'  : 0,
+                        'url'           : None, # this is more for examination purposes: providing the url to check the results
+                        'content'       : None, # the actual message content
+                        'contentHtml'   : None, # the raw HTML content
+                        'externalSources': []   # metadata from external sources
+                    }
+                    
+                    # Store the raw HTML content
+                    message['contentHtml'] = str(rawMessage)
+                    log("Stored raw HTML content", 14, verbose)
+                    
+                    log("Cleaning up quotes", 14, verbose)
+                    cleanMessage = cleanUpQuotes(rawMessage)
+                    message['quoteCount'] = cleanMessage['count']                
+                    cleanMessage = cleanMessage['text']
+                    log(f"Found {message['quoteCount']} quotes", 16, verbose)
 
-                cleanMessage = cleanUpQuotes(rawMessage)
-                message['quoteCount'] = cleanMessage['count']                
-                cleanMessage = cleanMessage['text']
+                    # Store the cleaned text content (without HTML tags)
+                    message['content'] = cleanMessage.get_text().strip()
+                    log("Stored cleaned text content", 14, verbose)
 
-                # we add current month to the countWords function, this way we can analyse if used words are changing over the time,
-                # same for countDomains, couple of lines later
-                message['wordCount'] = countWords(cleanMessage, currentMonth)
+                    # we add current month to the countWords function, this way we can analyse if used words are changing over the time,
+                    # same for countDomains, couple of lines later
+                    log("Counting words", 14, verbose)
+                    message['wordCount'] = countWords(cleanMessage, currentMonth, wordsUsed, verbose)
+                    log(f"Found {message['wordCount']} words", 16, verbose)
 
-                links = cleanMessage.find_all('a')
+                    links = cleanMessage.find_all('a')
+                    log(f"Found {len(links)} links", 14, verbose)
+                    
+                    if len(links) == 0:
+                        log("ERROR: No links found in message, skipping", 14, verbose)
+                        continue
 
-                message['url'] = 'https://blog.fefe.de/' + links[0]['href']
+                    message['url'] = 'https://blog.fefe.de/' + links[0]['href']
+                    log(f"Message URL: {message['url']}", 16, verbose)
 
-                # first get fefes secred timestamp                
-                hexTimestamp = re.search('\?ts\=(.*)', links[0]['href']).group(1)
-                message['hexTimestamp'] = hexTimestamp
-                timestamp = getTimestamp(hexTimestamp)            
-                message['timestamp'] = timestamp
+                    # first get fefes secred timestamp                
+                    timestamp_match = re.search('\?ts\=(.*)', links[0]['href'])
+                    if not timestamp_match:
+                        log("ERROR: No timestamp found in first link, skipping", 14, verbose)
+                        continue
+                        
+                    hexTimestamp = timestamp_match.group(1)
+                    message['hexTimestamp'] = hexTimestamp
+                    timestamp = getTimestamp(hexTimestamp)            
+                    message['timestamp'] = timestamp
+                    log(f"Timestamp: {timestamp} (hex: {hexTimestamp})", 16, verbose)
 
-                # then remove this first link, and get other references from this messages
-                links.pop(0)
-                message['sourcesCount'] = countDomains(links, currentMonth)
+                    # then remove this first link, and get other references from this messages
+                    links.pop(0)
+                    log("Counting domains", 14, verbose)
+                    message['sourcesCount'] = countDomains(links, currentMonth, domainsUsed, verbose)
+                    log(f"Found {message['sourcesCount']} external references", 16, verbose)
+                    
+                    # Parse external sources if requested
+                    if parseSource and len(links) > 0:
+                        log("Parsing external sources for metadata", 14, verbose)
+                        message['externalSources'] = parseExternalSources(links, verbose)
+                        log(f"Parsed {len(message['externalSources'])} external sources", 16, verbose)
+                    else:
+                        message['externalSources'] = []
 
-                if message['timestamp'] == None:
-                    print ('A message from {} has no timestamp. This cannot happen.'.format(url))
-                    raise SystemExit        
+                    if message['timestamp'] == None:
+                        log(f"WARNING: Message has no timestamp, skipping", 14, verbose)
+                        continue
 
-                if message['hexTimestamp'] in messages:
-                    print ('The message with the id {} already exists. This cannot happen.'.format(message['hexTimestamp']))
-                    raise SystemExit        
+                    if message['hexTimestamp'] in messages:
+                        log(f"WARNING: Message with id {message['hexTimestamp']} already exists, skipping", 14, verbose)
+                        continue
 
+                    messages[message['hexTimestamp']] = message
+                    log(f"Message {message['hexTimestamp']} successfully processed", 14, verbose)
+                    
+                except Exception as e:
+                    log(f"ERROR processing message {messageIndex + 1}: {str(e)}", 12, verbose)
+                    if verbose:
+                        import traceback
+                        traceback.print_exc()
+                    continue
 
-                messages[message['hexTimestamp']] = message
-
-
+        log(f"Completed processing month {currentMonth}", 4, verbose)
 
         # let's go to the next month
         startDateObj = startDateObj + relativedelta(months=+1)
@@ -158,27 +389,31 @@ def getMessages(startDate):
         i += 1
         
         if i >= iMax:
+            log("Reached iteration limit", 4, verbose)
             print ('\r\nReached limit')
             break
 
-    putDataToDisk()
+    log("Starting data output", 2, verbose)
+    putDataToDisk(messages, wordsUsed, domainsUsed, verbose)
     
+    log(f"Processing complete. Total messages: {len(messages)}", 0, verbose)
     print ('Found {} invalid <a>-tag(s) w/o href-attribute '.format(invalidATags))
 
-def putRawHtmlToDisk(html):
+def putRawHtmlToDisk(html, currentMonth, outputFile, verbose):
     
-    global outputFile, currentMonth
-
     if outputFile != None:
-        resOutputFile = open('{}{}'.format(currentMonth, outputFile), 'w', encoding='utf8')
+        fileName = '{}{}'.format(currentMonth, outputFile)
+        log(f"Writing raw HTML to file: {fileName}", 8, verbose)
+        resOutputFile = open(fileName, 'w', encoding='utf8')
         resOutputFile.write(html)
         resOutputFile.close()
+        log(f"Successfully wrote {len(html)} characters to {fileName}", 10, verbose)
 
 
-def prepareInput():
+def prepareInput(startDate, iMax, verbose):
     
-    global inputFile, iMax, startDateObj, endDateObj, pagesToQuery
-
+    log("Preparing input parameters", 4, verbose)
+    
     endDateObj = datetime.now()
     startDateObj = datetime.strptime(startDate, '%Y-%m')
 
@@ -186,40 +421,46 @@ def prepareInput():
 
     pagesToQuery = (timeDiff.years * 12) + timeDiff. months
 
+    log(f"Date range: {startDateObj.strftime('%Y-%m')} to {endDateObj.strftime('%Y-%m')}", 6, verbose)
+    log(f"Pages to query: {pagesToQuery}, iteration limit: {iMax}", 6, verbose)
+
     print ('Start month is {}'.format(startDateObj.strftime('%Y-%m')))
     print ('End month is {}'.format(endDateObj.strftime('%Y-%m')))
     print ('Requests are limited to {} iterations (aka months, {} years)'.format(iMax, round(iMax / 12, 2)))
 
+    return startDateObj, endDateObj, pagesToQuery
 
 
-def showProgress():
+def showProgress(i, pagesToQuery):
     
-    global progress, pagesToQuery
-
-    lastProgress = progress
     progress = round(100 * i / pagesToQuery)
-    if progress != lastProgress:
-        print ('{}% '.format(progress), end='')
-        # flush output buffer, to get progress in real time
-        sys.stdout.flush()
+    print ('{}% '.format(progress), end='')
+    # flush output buffer, to get progress in real time
+    sys.stdout.flush()
 
-def putDataToDisk():
+def putDataToDisk(messages, wordsUsed, domainsUsed, verbose):
     
-    global messages, wordsUsed, domainsUsed
+    log("Writing data to disk", 4, verbose)
     
     # put structured and aggregated data to files, lets provide csv and json, just for the case
+    log("Writing messages to CSV", 6, verbose)
     writeMessagesToFile(messages, 'messages.csv')
+    log("Writing words to CSV", 6, verbose)
     writeCsvToFile(wordsUsed, 'words.csv')
+    log("Writing domains to CSV", 6, verbose)
     writeCsvToFile(domainsUsed, 'domains.csv')
 
-    
-    jsonMessages = json.dumps(messages, ensure_ascii=False)
-    jsonWordsUsed = json.dumps(wordsUsed, ensure_ascii=False)
-    jsonDomainsUsed = json.dumps(domainsUsed, ensure_ascii=False)
+    log("Converting data to JSON", 6, verbose)
+    jsonMessages = json.dumps(messages, ensure_ascii=False, indent=2)
+    jsonWordsUsed = json.dumps(wordsUsed, ensure_ascii=False, indent=2)
+    jsonDomainsUsed = json.dumps(domainsUsed, ensure_ascii=False, indent=2)
 
+    log("Writing JSON files", 6, verbose)
     writeJsonToFile(jsonMessages, 'messages.json')
     writeJsonToFile(jsonWordsUsed, 'words.json')
     writeJsonToFile(jsonDomainsUsed, 'domains.json')
+    
+    log("All data files written successfully", 6, verbose)
 
 def writeCsvToFile(dictionary, fileName):
     
@@ -262,7 +503,38 @@ def cleanUpQuotes(message):
 
 
 
-def countDomains(domains, currentMonth):    
+def parseExternalSources(links, verbose):
+    """
+    Parse multiple external links to extract metadata.
+    Returns a list of metadata dictionaries.
+    """
+    external_sources = []
+    
+    for link in links:
+        if link.has_attr('href'):
+            href = link['href']
+        elif link.has_attr('ref'):
+            href = link['ref']
+        else:
+            continue
+            
+        # Skip self-references
+        if href.startswith('/?ts=') or href.startswith('?ts='):
+            continue
+            
+        # Make sure it's a full URL
+        if not href.startswith('http'):
+            continue
+            
+        metadata = parseExternalSource(href, verbose)
+        if metadata:
+            external_sources.append(metadata)
+    
+    return external_sources
+
+def countDomains(domains, currentMonth, domainsUsed, verbose):    
+
+    log(f"Counting domains for {len(domains)} links", 16, verbose)
 
     for index, value in enumerate(domains, start=0):
 
@@ -271,6 +543,7 @@ def countDomains(domains, currentMonth):
         elif value.has_attr('ref'):
             href = value['ref']
         else:
+            log(f"Link {index} has no href or ref attribute, skipping", 18, verbose)
             continue
 
         # does fefe references himself?
@@ -280,6 +553,8 @@ def countDomains(domains, currentMonth):
         else: 
             domain = href.split('//')[-1].split('/')[0]
             domain = re.sub('www[\d\.]*', '', domain)
+
+        log(f"Link {index}: {domain}", 18, verbose)
 
         if domain in domainsUsed[currentMonth]:
             domainsUsed[currentMonth][domain] += 1
@@ -291,10 +566,9 @@ def countDomains(domains, currentMonth):
         else:
             domainsUsed['sum'][domain] = 1
 
-
     return len(domains)
 
-def countWords(string, currentMonth):
+def countWords(string, currentMonth, wordsUsed, verbose):
 
     # remove self reference / link to current post
     cleanString = string.getText().replace('[l] ', '')
@@ -311,7 +585,10 @@ def countWords(string, currentMonth):
     # splitt the text based on spaces
     # also transform to lower case
     words = cleanString.lower().split()
+    
+    log(f"Processing {len(words)} words", 16, verbose)
 
+    validWords = 0
     for word in words:
         # remove unwanted stuff
         # strip will only remove pre- and suffixes, but i prefer the stronger reEx replace to 
@@ -323,6 +600,7 @@ def countWords(string, currentMonth):
         # and also ignore "words" starting with a number, because than it is not a word (by my definition) 
         # this will remove a lot of dirt
         if len(cleanWord) >= minWordLength and not cleanWord[0].isdigit():
+            validWords += 1
             
             if cleanWord in wordsUsed['sum']:
                 wordsUsed['sum'][cleanWord] += 1
@@ -334,6 +612,7 @@ def countWords(string, currentMonth):
             else:
                 wordsUsed[currentMonth][cleanWord] = 1
 
+    log(f"Found {validWords} valid words (min length: {minWordLength})", 18, verbose)
     return len(words)
 
 def getTimestamp(fefeTimestamp):
@@ -349,41 +628,52 @@ def getTimestamp(fefeTimestamp):
     return timestamp.strftime('%Y-%m-%d %H:%M:%S')
 
 def getParameters():
-
-    global inputFile, outputFile, startDate, iMax
     
-    helpMessage = 'Use it like that: \r\n'
-    helpMessage += ' fefe.py -s <start> -i <input> -o <output> -l <limit>\r\n\r\n'
-    helpMessage += '  -start: what month to start, format is Y-m, e.g. 2005-03 \r\n'
-    helpMessage += '  -input: file name, if provided, script will not load from remote location, date will be pre-pended, if you provide "_data.html", data will be loaded from 201503_data.html \r\n'
-    helpMessage += '  -output: file name, script will save raw html data into this file, for later use (warning: content will be overwritten), date will be prepended, e.g. 201503_data.html, if you set this to _data.html \r\n'
-    helpMessage += '  -limit: number to limit requests, each month requires one request, default is 240 (aka 240 months, 20 years), otherwise limit is current month'
+    parser = argparse.ArgumentParser(description='Fefe blog scraper')
+    
+    parser.add_argument('-s', '--start', 
+                        help='what month to start, format is Y-m, e.g. 2005-03')
+    
+    parser.add_argument('-i', '--input', 
+                        help='file name, if provided, script will not load from remote location, date will be pre-pended, if you provide "_data.html", data will be loaded from 201503_data.html')
+    
+    parser.add_argument('-o', '--output', 
+                        help='file name, script will save raw html data into this file, for later use (warning: content will be overwritten), date will be prepended, e.g. 201503_data.html, if you set this to _data.html')
+    
+    parser.add_argument('-l', '--limit', 
+                        type=int, 
+                        default=240,
+                        help='number to limit requests, each month requires one request, default is 240 (aka 240 months, 20 years), otherwise limit is current month')
 
-    try:
-        opts, args = getopt.getopt(sys.argv[1:],'hs:i:o:l:',['start=','input=', 'output=', 'limit='])
-    except getopt.GetoptError:
-        print (helpMessage)
-        sys.exit(2)
-    for opt, arg in opts:
-        if opt == '-h':
-            print (helpMessage)
-            sys.exit()
-        elif opt in ('-s', '--start'):
-            startDate = arg
-        elif opt in ('-i', '--input'):
-            inputFile = arg
-        elif opt in ('-o', '--output'):
-            outputFile = arg
-        elif opt in ('-l', '--limit'):
-            iMax = int(arg)
+    parser.add_argument('-v', '--verbose',
+                        action='store_true',
+                        help='verbose output, will print more information to console')
+
+    parser.add_argument('--parse-source',
+                        action='store_true',
+                        help='parse external links to extract meta data like titles from linked sources')
+
+    if len(sys.argv) == 1:
+        parser.print_help()
+        sys.exit(0)
+    args = parser.parse_args()
+    
+    startDate = args.start
+    inputFile = args.input
+    outputFile = args.output
+    iMax = args.limit
+    verbose = args.verbose
+    parseSource = args.parse_source
 
     if startDate == None and inputFile == None:
         print ('\r\n!!!Start date or input file are not provided. At least one is required!!! \r\n')
-        print (helpMessage)
+        parser.print_help()
         sys.exit(-1)
+    
+    return startDate, inputFile, outputFile, iMax, verbose, parseSource
 
 if __name__ == '__main__':
      
-    getParameters()
+    startDate, inputFile, outputFile, iMax, verbose, parseSource = getParameters()
 
-    getMessages(startDate)
+    getMessages(startDate, inputFile, outputFile, iMax, verbose, parseSource)
