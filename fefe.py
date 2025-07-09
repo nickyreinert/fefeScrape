@@ -195,10 +195,13 @@ def getMessages(startDate, inputFile, outputFile, iMax, verbose, parseSource, fo
     while startDateObj <= endDateObj:
 
         currentMonth = startDateObj.strftime('%Y%m')
+        currentUrl = urlTemplate + currentMonth
+        print(f"Processing month: {currentMonth} - {currentUrl}")
         log(f"Processing month: {currentMonth}", 4, verbose)
 
         # Check if this month has already been processed
         if not force and isMonthAlreadyProcessed(currentMonth, verbose):
+            print(f"Month {currentMonth} already processed, skipping")
             log(f"Month {currentMonth} already processed, skipping", 4, verbose)
             startDateObj = startDateObj + relativedelta(months=+1)
             i += 1
@@ -314,6 +317,18 @@ def getMessages(startDate, inputFile, outputFile, iMax, verbose, parseSource, fo
             
             log(f"Found {len(rawMessages)} messages after manual parsing", 10, verbose)
 
+            # Count total messages with ts parameter for progress tracking
+            totalMessages = 0
+            for msg in rawMessages:
+                links = msg.find_all('a')
+                for link in links:
+                    if link.has_attr('href') and '?ts=' in link['href']:
+                        totalMessages += 1
+                        break
+
+            print(f"Found {totalMessages} messages to process in {currentMonth}")
+            processedMessages = 0
+
             for messageIndex, rawMessage in enumerate(rawMessages):
                 log(f"Processing message {messageIndex + 1}/{len(rawMessages)}", 12, verbose)
 
@@ -395,6 +410,8 @@ def getMessages(startDate, inputFile, outputFile, iMax, verbose, parseSource, fo
                         continue
 
                     messages[message['hexTimestamp']] = message
+                    processedMessages += 1
+                    print(f"Processing {currentMonth}: {processedMessages}/{totalMessages} messages", end='\r')
                     log(f"Message {message['hexTimestamp']} successfully processed", 14, verbose)
                     
                 except Exception as e:
@@ -404,6 +421,7 @@ def getMessages(startDate, inputFile, outputFile, iMax, verbose, parseSource, fo
                         traceback.print_exc()
                     continue
 
+        print(f"\nCompleted processing month {currentMonth} - {processedMessages} messages processed")
         log(f"Completed processing month {currentMonth}", 4, verbose)
 
         # let's go to the next month
