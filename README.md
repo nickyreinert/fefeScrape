@@ -51,3 +51,58 @@ source .venv/bin/activate
 ```python
 pip3 install -r requirements.txt 
 ```
+
+## Structured SFT Pipeline
+
+The fine-tuning flow is built around supervised examples of topic to comment, not raw post continuation.
+
+1. Build the structured dataset:
+
+```bash
+./phase1_prepare_raw_data.py
+```
+
+Inspect noisy topic candidates before training:
+
+```bash
+./phase1_audit_training_data.py
+```
+
+This generates [prepared/fefe_training_data.json](prepared/fefe_training_data.json) with rows shaped like:
+
+```json
+{
+	"topic": "Innenministerium plant neue Chatkontrolle",
+	"context": "Diskutiert wird eine Ausweitung automatisierter Überwachung privater Kommunikation.",
+	"url": "https://example.invalid/story",
+	"target_comment": "[l] ..."
+}
+```
+
+2. Fine-tune the LoRA adapter:
+
+```bash
+./phase2_training.py
+```
+
+Training converts each row into one fixed prompt structure and feeds it through the Llama 3 chat template:
+
+```text
+### Instruction
+Write a short German blog comment in a dry, ironic, satirical tone.
+
+### Input
+Topic: <TOPIC>
+Context: <OPTIONAL CONTEXT>
+URL: <OPTIONAL URL>
+
+### Response
+```
+
+3. Run inference with the exact same structure:
+
+```bash
+./phase3_inference.py
+```
+
+If [fefe-lora-llama3](fefe-lora-llama3) exists, inference loads the trained LoRA adapter on top of the base model.
