@@ -30,7 +30,7 @@ EXPERIMENTS = {
     "E3": {"packing": False, "epochs": 1, "lr": 2e-5, "note": "same as E2, packing off"},
 }
 
-base_model = "meta-llama/Meta-Llama-3-8B-Instruct"
+base_model = "meta-llama/Llama-3.2-3B-Instruct"
 
 
 def select_dtype_and_precision():
@@ -38,6 +38,8 @@ def select_dtype_and_precision():
         if hasattr(torch.cuda, "is_bf16_supported") and torch.cuda.is_bf16_supported():
             return torch.bfloat16, {"bf16": True, "fp16": False}
         return torch.float16, {"bf16": False, "fp16": True}
+    if torch.backends.mps.is_available():
+        return torch.float16, {"bf16": False, "fp16": False}
     return torch.float32, {"bf16": False, "fp16": False}
 
 
@@ -72,14 +74,17 @@ def main():
     model_dtype, precision_flags = select_dtype_and_precision()
     model = AutoModelForCausalLM.from_pretrained(
         base_model,
-        device_map="auto",
         torch_dtype=model_dtype,
+        low_cpu_mem_usage=True,
     )
 
+    # Required for gradient checkpointing with PEFT on non-CUDA backends
+    model.enable_input_require_grads()
+
     lora_config = LoraConfig(
-        r=16,
-        lora_alpha=32,
-        target_modules=["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
+        r=8,
+        lora_alpha=16,
+        target_modules=["q_proj", "v_proj"],
         lora_dropout=0.05,
         bias="none",
         task_type="CAUSAL_LM",
@@ -105,7 +110,7 @@ def main():
         gradient_accumulation_steps=8,
         num_train_epochs=epochs,
         learning_rate=lr,
-        logging_steps=10,
+        logging_steps=1,
         save_strategy="epoch",
         optim="adamw_torch",
         report_to=[],
@@ -115,6 +120,8 @@ def main():
         max_length=1024,
         packing=packing,
     )
+
+    model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
 
     trainer = SFTTrainer(
         model=model,
