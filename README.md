@@ -106,3 +106,60 @@ URL: <OPTIONAL URL>
 ```
 
 If [fefe-lora-llama3](fefe-lora-llama3) exists, inference loads the trained LoRA adapter on top of the base model.
+
+
+## Training Experiments
+
+The script supports four experiment configurations (E0-E3) with different data filtering and sampling strategies:
+
+### E0: Pure Baseline
+```bash
+python3 phase2_training.py --experiment E0
+```
+- **Data**: All posts without any filtering
+- **Sampling**: Uniform (each example weighted equally)
+- **Packing**: Enabled (multiple sequences per batch)
+- Use this if working with unlimited GPU memory
+
+### E1: Hard-Drop Filtering + Uniform Sampling
+```bash
+PYTORCH_ALLOC_CONF=expandable_segments:True python3 phase2_training.py --experiment E1 --load-in-8bit --output ./fefe-lora-llama3-E1
+```
+- **Data**: Low-quality posts removed during preprocessing (HTML-first filtering)
+- **Sampling**: Uniform across remaining data
+- **Packing**: Enabled
+- **Memory optimization**: Recommended to use `--load-in-8bit` flag for GPUs under 8GB VRAM
+- Good baseline for quality-focused training
+
+### E2: Hard-Drop + Weighted Sampling
+```bash
+PYTORCH_ALLOC_CONF=expandable_segments:True python3 phase2_training.py --experiment E2 --load-in-8bit --output ./fefe-lora-llama3-E2
+```
+- **Data**: Low-quality posts removed
+- **Sampling**: Quality-weighted (higher-quality examples sampled more frequently)
+- **Packing**: Enabled
+- Balances data quality with importance weighting
+
+### E3: Hard-Drop + Weighted Sampling (No Packing)
+```bash
+PYTORCH_ALLOC_CONF=expandable_segments:True python3 phase2_training.py --experiment E3 --load-in-8bit  --output ./fefe-lora-llama3-E3
+```
+- **Data**: Low-quality posts removed
+- **Sampling**: Quality-weighted
+- **Packing**: Disabled (one sequence per batch)
+- Useful for debugging or reducing memory fragmentation further
+
+### Memory Optimization Tips
+For GPUs with <8GB VRAM, always include these flags:
+```bash
+PYTORCH_ALLOC_CONF=expandable_segments:True python3 phase2_training.py --experiment E1 --load-in-8bit
+```
+
+Further reduce memory usage if needed:
+```bash
+PYTORCH_ALLOC_CONF=expandable_segments:True python3 phase2_training.py --experiment E1 --load-in-8bit --max-length 256 --grad-accum 2
+```
+
+- `--load-in-8bit`: Quantize model to 8-bit (reduces model size ~75%)
+- `--max-length 256`: Reduce from default 512 (halves sequence memory)
+- `--grad-accum 2`: Reduce from default 4 (faster iterations, noisier gradients)

@@ -15,7 +15,7 @@ from urllib3.exceptions import NotOpenSSLWarning
 warnings.filterwarnings("ignore", category=NotOpenSSLWarning)
 
 from datasets import Dataset, load_dataset
-from transformers import AutoTokenizer, AutoModelForCausalLM
+from transformers import AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig
 from peft import LoraConfig, get_peft_model
 from trl import SFTConfig, SFTTrainer
 import torch
@@ -52,6 +52,9 @@ def main():
     parser.add_argument("--packing", type=bool, default=None, help="Enable sequence packing")
     parser.add_argument("--epochs", type=int, default=None, help="Number of training epochs")
     parser.add_argument("--lr", type=float, default=None, help="Learning rate")
+    parser.add_argument("--max-length", type=int, default=512, help="Maximum sequences length (default: 512)")
+    parser.add_argument("--grad-accum", type=int, default=4, help="Gradient accumulation steps (default: 4)")
+    parser.add_argument("--load-in-8bit", action="store_true", help="Load model in 8-bit mode for memory savings")
     args = parser.parse_args()
 
     # Resolve config: experiment preset, then CLI overrides, then defaults
@@ -66,17 +69,36 @@ def main():
         epochs = args.epochs if args.epochs is not None else 1
         lr = args.lr if args.lr is not None else 2e-5
 
-    print("Config: packing={}, epochs={}, lr={}".format(packing, epochs, lr))
+    max_length = args.max_length
+    grad_accum = args.grad_accum
+    load_in_8bit = args.load_in_8bit
+    print("Config: packing={}, epochs={}, lr={}, max_length={}, grad_accum={}, load_in_8bit={}".format(
+        packing, epochs, lr, max_length, grad_accum, load_in_8bit))
 
     tokenizer = AutoTokenizer.from_pretrained(base_model)
     tokenizer.pad_token = tokenizer.eos_token
 
     model_dtype, precision_flags = select_dtype_and_precision()
-    model = AutoModelForCausalLM.from_pretrained(
-        base_model,
-        torch_dtype=model_dtype,
-        low_cpu_mem_usage=True,
-    )
+    
+    if load_in_8bit:
+        quantization_config = BitsAndBytesConfig(
+            load_in_8bit=True,
+            bnb_8bit_quant_type="nf8",
+            bnb_8bit_compute_dtype=torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16,
+            bnb_8bit_use_double_quant=True,
+        )
+        model = AutoModelForCausalLM.from_pretrained(
+            base_model,
+            quantization_config=quantization_config,
+            low_cpu_mem_usage=True,
+            device_map="auto",
+        )
+    else:
+        model = AutoModelForCausalLM.from_pretrained(
+            base_model,
+            dtype=model_dtype,
+            low_cpu_mem_usage=True,
+        )
 
     # Required for gradient checkpointing with PEFT on non-CUDA backends
     model.enable_input_require_grads()
@@ -107,7 +129,7 @@ def main():
     training_args = SFTConfig(
         output_dir=output_dir,
         per_device_train_batch_size=1,
-        gradient_accumulation_steps=8,
+        gradient_accumulation_steps=grad_accum,
         num_train_epochs=epochs,
         learning_rate=lr,
         logging_steps=1,
@@ -117,7 +139,7 @@ def main():
         bf16=precision_flags["bf16"],
         fp16=precision_flags["fp16"],
         dataset_text_field="text",
-        max_length=1024,
+        max_length=max_length,
         packing=packing,
     )
 
