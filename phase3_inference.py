@@ -28,7 +28,7 @@ tokenizer.pad_token = tokenizer.eos_token
 model = AutoModelForCausalLM.from_pretrained(
     base_model,
     device_map="auto",
-    torch_dtype=select_model_dtype(),
+    dtype=select_model_dtype(),
 )
 
 if adapter_path.exists():
